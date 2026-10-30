@@ -949,6 +949,22 @@ async def search_cmd(interaction: discord.Interaction, title: str):
 search_cmd.autocomplete("title")(title_autocomplete)
 
 
+def theatrical_dates(movie: dict) -> list[date]:
+    """Regional theatrical dates, including re-releases, without unrelated releases."""
+    dates = set()
+    for region in movie.get("release_dates", {}).get("results", []):
+        if region.get("iso_3166_1") != REGION:
+            continue
+        for release in region.get("release_dates", []):
+            if release.get("type") not in (2, 3):
+                continue
+            try:
+                dates.add(date.fromisoformat((release.get("release_date") or "")[:10]))
+            except ValueError:
+                continue
+    return sorted(dates)
+
+
 async def cinema_embed(title: str, gte: date, lte: date, by_date: bool) -> discord.Embed:
     params = {"region": REGION, "with_release_type": "2|3", "release_date.gte": str(gte),
               "release_date.lte": str(lte), "include_adult": "false", "sort_by": "popularity.desc"}
@@ -960,9 +976,12 @@ async def cinema_embed(title: str, gte: date, lte: date, by_date: bool) -> disco
     for d in dets:
         if not d.get("id"):
             continue
-        a = analyze(d)
-        if a["cinema_date"]:
-            items.append((d, a))
+        dates = theatrical_dates(d)
+        matching = [release for release in dates if gte <= release <= lte]
+        if not matching:
+            continue
+        selected = matching[0]
+        items.append((d, {"cinema_date": selected, "rerelease": dates[0] < selected}))
     if by_date:
         items.sort(key=lambda x: x[1]["cinema_date"])
     else:
@@ -970,13 +989,16 @@ async def cinema_embed(title: str, gte: date, lte: date, by_date: bool) -> disco
     lines = []
     for d, a in items[:10]:
         rating = f"⭐ {d['vote_average']:.1f} · " if d.get("vote_average") and d.get("vote_count", 0) >= 50 else ""
-        when = f"opens {ts(a['cinema_date'])} ({ts(a['cinema_date'], 'R')})" if a["cinema_status"] == "soon" \
-            else f"opened {ts(a['cinema_date'])}"
+        release = a["cinema_date"]
+        label = "re-release" if a["rerelease"] else "opens" if release >= today() else "opened"
+        # Release dates are calendar dates; avoid shifting them into another day
+        # when Discord renders a midnight timestamp in a viewer's timezone.
+        when = f"{label} {release:%d %b %Y}"
         genres = ", ".join(g["name"] for g in d.get("genres", [])[:2])
         lines.append(f"**[{d['title']}](https://www.themoviedb.org/movie/{d['id']})** · {rating}{genres}\n{when}")
     emb = discord.Embed(title=title, description="\n\n".join(lines) or "Nothing found for this window.",
                         color=discord.Color.red())
-    emb.set_footer(text="Dates from TMDB for " + REGION + " · use /search for a full card and showtime links")
+    emb.set_footer(text=f"TMDB · {REGION} · {gte:%d %b %Y}–{lte:%d %b %Y} · Today uses {TZ.key}")
     return emb
 
 
@@ -995,7 +1017,7 @@ async def comingsoon(interaction: discord.Interaction):
     await interaction.response.defer()
     t = today()
     await interaction.followup.send(embed=await cinema_embed(f"📅 Coming soon to {REGION} cinemas",
-                                                             t + timedelta(days=1), t + timedelta(days=60), by_date=True))
+                                                             t, t + timedelta(days=60), by_date=True))
 
 
 @bot.tree.command(name="person", description="Top films from a director or actor")
@@ -1090,6 +1112,8 @@ bot.tree.add_command(watchlist)
 class ServicesView(discord.ui.View):
     def __init__(self, providers: list[tuple[int, str]], current: set[int]):
         super().__init__(timeout=300)
+        self.visible = {pid for pid, _ in providers[:25]}
+        self.current = current
         opts = [discord.SelectOption(label=n[:100], value=str(pid), default=pid in current)
                 for pid, n in providers[:25]]
         sel = discord.ui.Select(placeholder="Pick the services you subscribe to", min_values=0,
@@ -1099,20 +1123,29 @@ class ServicesView(discord.ui.View):
         self.add_item(sel)
 
     async def on_pick(self, interaction: discord.Interaction):
-        ids = [int(v) for v in self.sel.values]
-        await run("INSERT OR REPLACE INTO services VALUES(?,?)", (interaction.user.id, json.dumps(ids)))
+        ids = (self.current - self.visible) | {int(v) for v in self.sel.values}
+        await run("INSERT OR REPLACE INTO services VALUES(?,?)", (interaction.user.id, json.dumps(sorted(ids))))
         await interaction.response.edit_message(
             content=f"✅ Saved {len(ids)} service(s). The **Can I watch?** button will use them.", view=None)
 
 
 @bot.tree.command(name="myservices", description="Tell me which streaming services you have")
-async def myservices(interaction: discord.Interaction):
+@app_commands.describe(search="Search a streaming service, such as Disney or Max; repeat to add more")
+async def myservices(interaction: discord.Interaction, search: Optional[str] = None):
     provs = await bot.api.providers()
     if not provs:
         return await interaction.response.send_message("Couldn't load the streaming service list. Try again later.", ephemeral=True)
     row = await q_one("SELECT provider_ids FROM services WHERE user_id=?", (interaction.user.id,))
     cur = set(json.loads(row["provider_ids"])) if row else set()
-    await interaction.response.send_message("Select all the services you have:", view=ServicesView(provs, cur), ephemeral=True)
+    if search:
+        matches = [(pid, name) for pid, name in provs if search.casefold() in name.casefold()]
+        if not matches:
+            return await interaction.response.send_message(
+                f"No movie provider matching **{trunc(search, 40)}** was returned for {REGION}. Try another name, such as Max, HBO, or Disney.", ephemeral=True)
+        provs = matches
+    await interaction.response.send_message(
+        "Select the services you use, then submit. Use `/myservices search:Disney` or `/myservices search:Max` for providers beyond the first page; earlier selections stay saved.",
+        view=ServicesView(provs, cur), ephemeral=True)
 
 
 # ---- movie night poll ------------------------------------------------------ #

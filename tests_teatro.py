@@ -1,8 +1,8 @@
 """Offline regression tests; no Discord token or network required."""
 import unittest
-from datetime import timedelta
+from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 import aiosqlite
 import Teatro_Bot as core
 from teatro_workflows import migrate, Nights, install
@@ -120,6 +120,31 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         await self.member_bot.tree.get_command('delete-my-data').callback(i,True)
         for table in ('private_watchlist','ratings','trivia_scores'):
             self.assertEqual((await core.q_one(f'SELECT COUNT(*) n FROM {table}'))['n'],0)
+
+    async def test_cinema_window_excludes_past_and_uses_upcoming_rerelease(self):
+        def movie(mid, title, releases, region=None):
+            return {'id': mid, 'title': title, 'release_dates': {'results': [
+                {'iso_3166_1': region or core.REGION, 'release_dates': releases}]}}
+        def release(day, kind=3):
+            return {'release_date': day+'T00:00:00.000Z', 'type': kind}
+        films = [
+            movie(1, 'Past only', [release('2024-01-01')]),
+            movie(2, 'Returning film', [release('2024-01-01'), release('2026-11-01')]),
+            movie(3, 'Today film', [release('2026-10-30')]),
+            movie(4, 'Too late', [release('2027-01-01')]),
+            movie(5, 'Digital only', [release('2026-11-01', 4)]),
+            movie(6, 'Wrong region', [release('2026-11-01')], 'ZZ'),
+            movie(7, 'Invalid date', [release('invalid')]),
+        ]
+        api = SimpleNamespace(tmdb=AsyncMock(return_value={'results': [{'id': d['id']} for d in films]}),
+                              details=AsyncMock(side_effect=films))
+        with patch.object(core, 'bot', SimpleNamespace(api=api)), patch.object(core, 'today', return_value=date(2026,10,30)):
+            embed = await core.cinema_embed('Coming soon', date(2026,10,30), date(2026,12,29), True)
+        self.assertIn('opens 30 Oct 2026', embed.description)
+        self.assertIn('re-release 01 Nov 2026', embed.description)
+        for excluded in ('Past only','Too late','Digital only','Wrong region','Invalid date','2024'):
+            self.assertNotIn(excluded, embed.description)
+        self.assertLess(embed.description.index('Today film'), embed.description.index('Returning film'))
 
     async def test_register_workflow_commands(self):
         bot=core.FilmBot()

@@ -36,9 +36,9 @@ Host commands: `/movienight reschedule`, `/movienight cancel`. One active night 
 
 - `/help`: onboarding.
 - `/film`, `/search`, `/person`: discover and inspect films.
-- `/preferences`, `/myservices`: member preferences and services. Explicit film filters override preferences; personal watched movies are excluded.
+- `/preferences`, `/myservices`: member preferences and services. Use `/myservices search:Disney` or `/myservices search:Max` to find providers beyond the first 25; selections from previous searches are preserved. Explicit film filters override preferences; personal watched movies are excluded.
 - `/watchlist add`, `/watchlist view`, `/watchlist remove`: public shared watchlist. Remove uses exact autocomplete selections.
-- `/nowplaying`, `/comingsoon`: recorded regional releases, not verified showtimes.
+- `/nowplaying`, `/comingsoon`: recorded regional releases, not verified showtimes. Coming Soon validates regional theatrical dates from today through the next 60 days using `TIMEZONE`; older films with an upcoming theatrical date are labeled re-releases.
 - `/leaderboard`, `/recap`, `/trivia`: community ratings and activities.
 - `/settings`: admin daily-post pause and local time.
 - `/notifications`: release-alert ping opt-out.
