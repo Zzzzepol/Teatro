@@ -1,4 +1,4 @@
-"""Persistent movie nights and schema upgrades for Teatro."""
+"""Handle movie nights and database updates."""
 import asyncio
 import json
 import logging
@@ -27,7 +27,7 @@ CREATE INDEX IF NOT EXISTS ratings_movie ON ratings(guild_id,tmdb_id);
 async def migrate(db):
     await db.executescript(SCHEMA)
     if not await (await db.execute('SELECT 1 FROM migrations WHERE version=1')).fetchone():
-        # Old per-message votes collapse to each member's latest movie rating.
+
         await db.execute("INSERT OR REPLACE INTO ratings SELECT guild_id,user_id,tmdb_id,vote,created_at FROM votes WHERE vote!='seen' ORDER BY created_at,message_id")
         await db.execute("INSERT OR REPLACE INTO watched SELECT guild_id,user_id,tmdb_id,created_at FROM votes WHERE vote='seen' ORDER BY created_at,message_id")
         await db.execute('INSERT INTO migrations VALUES(1)')
@@ -52,9 +52,9 @@ class Nights:
 
     async def eligible(self, night, movie):
         if not movie.get('id') or movie.get('adult'):
-            raise ValueError('That film is unavailable or excluded.')
+            raise ValueError('Movie not found in TMDB or excluded as adult. Select a title from autocomplete and try again.')
         if not movie.get('runtime') or movie['runtime'] > night['max_runtime']:
-            raise ValueError('This film has an unknown runtime or exceeds the runtime limit.')
+            raise ValueError(f"This film runs {movie.get('runtime') or 'an unknown number of'} minutes; this night allows at most {night['max_runtime']} minutes. A host can create a new night with a higher max_runtime.")
         if night['language'] and movie.get('original_language') != night['language']:
             raise ValueError('This film does not match the selected language.')
         if night['platform'] and int(night['platform']) not in {p for p, _ in self.c.analyze(movie)['flat']}:
@@ -80,7 +80,7 @@ class Nights:
         winner = await self.c.q_one('SELECT n.*,COUNT(v.user_id) votes FROM nominations n LEFT JOIN night_votes v ON n.night_id=v.night_id AND n.tmdb_id=v.tmdb_id WHERE n.night_id=? GROUP BY n.tmdb_id ORDER BY votes DESC,n.tmdb_id LIMIT 1', (night['id'],))
         if not winner:
             raise ValueError('No nominations found.')
-        # Save the outcome before calling Discord. Scheduling is retried by the worker.
+
         await self.c.run("UPDATE nights SET state='scheduling',winner=? WHERE id=?", (winner['tmdb_id'],night['id']))
 
     async def schedule(self, night):
@@ -88,7 +88,7 @@ class Nights:
         winner = await self.c.q_one('SELECT * FROM nominations WHERE night_id=? AND tmdb_id=?',(night['id'],night['winner']))
         start = datetime.fromisoformat(night['start'])
         if start <= self.now():
-            # Keep a missed event actionable instead of silently discarding it.
+
             return
         marker = f'Teatro movie night #{night["id"]}'
         events = await guild.fetch_scheduled_events()

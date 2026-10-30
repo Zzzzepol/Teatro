@@ -1,9 +1,4 @@
-"""
-Film Club - a Discord bot for daily film recommendations.
-
-Data: TMDB (film info, streaming providers, cinema dates), OMDb (IMDb / RT / Metacritic).
-Everything is configured through the .env file. See README.md.
-"""
+"""Teatro is a Discord bot for movie recommendations and movie nights."""
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +9,7 @@ import os
 import random
 import re
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Optional
@@ -29,9 +25,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
+
+
+
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 TMDB_KEY = os.getenv("TMDB_API_KEY", "")
 OMDB_KEY = os.getenv("OMDB_API_KEY", "")
@@ -39,12 +35,12 @@ REGION = os.getenv("REGION", "PH").upper()
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Manila"))
 POST_HOUR, POST_MIN = (int(x) for x in os.getenv("DAILY_TIME", "09:00").split(":"))
 DB_PATH = os.getenv("DB_PATH", "filmclub.db")
-DEV_GUILD_ID = os.getenv("GUILD_ID")  # optional: makes slash commands appear instantly
+DEV_GUILD_ID = os.getenv("GUILD_ID")
 
-MIN_RATING = 7.0     # "actually good" threshold (TMDB score)
-MIN_VOTES = 1000     # ...with enough votes to be meaningful
+MIN_RATING = 7.0
+MIN_VOTES = 1000
 
-# What the daily post does each weekday (Mon=0 ... Sun=6)
+
 ROTATION = {0: "streaming", 1: "hidden", 2: "streaming", 3: "classic",
             4: "cinema", 5: "streaming", 6: "filipino"}
 
@@ -68,7 +64,7 @@ MOODS = {
 LANGS = {"English": "en", "Filipino": "tl", "Korean": "ko", "Japanese": "ja",
          "French": "fr", "Spanish": "es", "Hindi": "hi", "Thai": "th"}
 
-# TMDB has no showtimes data, so the bot links to a search for each chain.
+
 CINEMAS = ["SM Cinema", "Ayala Malls Cinemas", "Robinsons Movieworld",
            "Megaworld Cinemas", "Gateway Cineplex", "Any cinema near me"]
 
@@ -79,9 +75,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("filmclub")
 
 
-# --------------------------------------------------------------------------- #
-# Small helpers
-# --------------------------------------------------------------------------- #
+
+
+
 def today() -> date:
     return datetime.now(TZ).date()
 
@@ -96,7 +92,7 @@ def trunc(s: Optional[str], n: int) -> str:
 
 
 def ts(d: date, style: str = "D") -> str:
-    """Discord timestamp markup for a date (renders in each viewer's own locale)."""
+    """Turn a date into a Discord timestamp."""
     return f"<t:{int(datetime.combine(d, dtime(0, 0), tzinfo=TZ).timestamp())}:{style}>"
 
 
@@ -111,9 +107,9 @@ def runtime_str(minutes: Optional[int]) -> str:
     return f"{h}h {m}m" if h else f"{m}m"
 
 
-# --------------------------------------------------------------------------- #
-# Database
-# --------------------------------------------------------------------------- #
+
+
+
 DB: aiosqlite.Connection
 WRITE_LOCK = asyncio.Lock()
 RATING_LOCK = asyncio.Lock()
@@ -154,9 +150,9 @@ async def run(sql: str, args: tuple = ()):
         await DB.commit()
 
 
-# --------------------------------------------------------------------------- #
-# API clients (TMDB + OMDb) with light caching
-# --------------------------------------------------------------------------- #
+
+
+
 class Api:
     def __init__(self, session: aiohttp.ClientSession):
         self.s = session
@@ -229,11 +225,11 @@ class Api:
         return lst
 
 
-# --------------------------------------------------------------------------- #
-# Film analysis + embed
-# --------------------------------------------------------------------------- #
+
+
+
 def analyze(d: dict) -> dict:
-    """Pull region-specific info out of a TMDB details payload."""
+    """Get release and streaming details for the selected region."""
     t = today()
     cert, cdate = None, None
     for r in d.get("release_dates", {}).get("results", []):
@@ -308,7 +304,7 @@ def build_embed(d: dict, o: dict, a: dict, heading: Optional[str]) -> discord.Em
     emb.add_field(name="Director", value=", ".join(directors) or "N/A", inline=True)
     emb.add_field(name="Cast", value=", ".join(cast) or "N/A", inline=False)
 
-    # Ratings
+
     ratings = {r["Source"]: r["Value"] for r in o.get("Ratings", [])}
     parts = []
     if o.get("imdbRating") not in (None, "N/A"):
@@ -335,7 +331,7 @@ def build_embed(d: dict, o: dict, a: dict, heading: Optional[str]) -> discord.Em
     if o.get("Awards") not in (None, "N/A"):
         emb.add_field(name="Awards", value=trunc(o["Awards"], 250), inline=False)
 
-    # Cinema alert
+
     if a["cinema_status"] == "now":
         emb.add_field(name="🎟️ Recent theatrical release",
                       value=f"Opened in {REGION} on {ts(a['cinema_date'])}. Use the menu below to find showtimes.",
@@ -345,7 +341,7 @@ def build_embed(d: dict, o: dict, a: dict, heading: Optional[str]) -> discord.Em
                       value=f"Opens in {REGION} on {ts(a['cinema_date'])} ({ts(a['cinema_date'], 'R')}).",
                       inline=False)
 
-    # Streaming
+
     lines = []
     if a["stream"]:
         lines.append("▶️ **Stream:** " + ", ".join(a["stream"][:8]))
@@ -383,9 +379,9 @@ async def make_card(movie_id: int, heading: Optional[str] = None) -> Optional[Ca
     return Card(build_embed(d, o, a, heading), links, a["cinema_status"] is not None, title, d["id"])
 
 
-# --------------------------------------------------------------------------- #
-# Picking films
-# --------------------------------------------------------------------------- #
+
+
+
 def build_params(mode: str = "any", genre=None, decade=None, language=None,
                  max_runtime=None, platform=None, mood=None) -> dict:
     t = today()
@@ -394,7 +390,7 @@ def build_params(mode: str = "any", genre=None, decade=None, language=None,
         p.update({"watch_region": REGION, "with_watch_monetization_types": "flatrate",
                   "vote_average.gte": MIN_RATING, "vote_count.gte": MIN_VOTES, "sort_by": "popularity.desc"})
     elif mode == "cinema":
-        # New releases have fewer votes, so the bar is lower than for older films.
+
         p.update({"region": REGION, "with_release_type": "2|3",
                   "release_date.gte": str(t - timedelta(days=60)), "release_date.lte": str(t),
                   "vote_average.gte": 6.5, "vote_count.gte": 100, "sort_by": "popularity.desc"})
@@ -451,23 +447,24 @@ async def pick_film(guild_id: Optional[int], params: dict, exclude=()) -> Option
     return None
 
 
-# --------------------------------------------------------------------------- #
-# Posting a film card
-# --------------------------------------------------------------------------- #
+
+
+
 async def deliver(channel, card: Card, *, guild_id: int, kind: str, content: Optional[str] = None,
                   interaction: Optional[discord.Interaction] = None, thread: bool = True):
     view = FilmView(card.links, card.cinema)
-    compact = card.embed.copy()
-    compact.description = trunc(compact.description, 300)
-    compact.clear_fields()
-    for field in card.embed.fields:
-        if field.name.startswith("Where to watch") or field.name in ("Runtime", "Ratings", "Genre"):
-            compact.add_field(name=field.name, value=field.value, inline=field.inline)
-    compact.set_image(url=None)
+    embed = deepcopy(card.embed)
+    if kind != "daily":
+        embed.description = trunc(embed.description, 300)
+        embed.clear_fields()
+        for field in card.embed.fields:
+            if field.name.startswith("Where to watch") or field.name in ("Runtime", "Ratings", "Genre"):
+                embed.add_field(name=field.name, value=field.value, inline=field.inline)
+        embed.set_image(url=None)
     if interaction:
-        msg = await interaction.followup.send(embed=compact, view=view, wait=True)
+        msg = await interaction.followup.send(embed=embed, view=view, wait=True)
     else:
-        msg = await channel.send(content=content, embed=compact, view=view,
+        msg = await channel.send(content=content, embed=embed, view=view,
                                  allowed_mentions=discord.AllowedMentions(roles=True))
     await run("INSERT OR REPLACE INTO posts VALUES(?,?,?,?,?,?,?,?,?)",
               (msg.id, guild_id, channel.id, card.tmdb_id, card.title,
@@ -502,9 +499,9 @@ async def post_daily(guild_id: int, channel_id: int, role_id: Optional[int], for
     return True
 
 
-# --------------------------------------------------------------------------- #
-# Persistent views (buttons keep working after restarts)
-# --------------------------------------------------------------------------- #
+
+
+
 async def get_post(message_id: int):
     return await q_one("SELECT * FROM posts WHERE message_id=?", (message_id,))
 
@@ -541,7 +538,7 @@ def _vote_cb(key: str):
 
 
 async def mark_known_state(guild_id: int, tmdb_id: int):
-    """So we don't 'alert' about things that were already true when the film was added."""
+    """Remember alerts that were already true when a film was added."""
     a = analyze(await bot.api.details(tmdb_id))
     if a["cinema_date"] and a["cinema_date"] <= today():
         await run("INSERT OR IGNORE INTO notified VALUES(?,?,?)", (guild_id, tmdb_id, "cinema"))
@@ -634,8 +631,16 @@ def _discover_cb(similar):
     return callback
 
 
-class FilmView(discord.ui.View):
-    """links=None builds the 'registration' version used to revive buttons after a restart."""
+class ServerOnlyView(discord.ui.View):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if ALLOWED_GUILD_ID and interaction.guild_id != int(ALLOWED_GUILD_ID):
+            await interaction.response.send_message("This bot is reserved for its home server.", ephemeral=True)
+            return False
+        return True
+
+
+class FilmView(ServerOnlyView):
+    """Build the buttons shown under a movie post."""
 
     def __init__(self, links: Optional[dict] = None, cinema: bool = False, counts: Optional[dict] = None):
         super().__init__(timeout=None)
@@ -675,7 +680,7 @@ class FilmView(discord.ui.View):
             self.add_item(sel)
 
 
-class RoleView(discord.ui.View):
+class RoleView(ServerOnlyView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -699,7 +704,7 @@ class RoleView(discord.ui.View):
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-# ---- movie night poll ------------------------------------------------------ #
+
 def poll_embed(options: list[dict], counts: dict) -> discord.Embed:
     total = sum(counts.values())
     lines = []
@@ -718,7 +723,7 @@ def _poll_cb(idx: int):
     return cb
 
 
-class PollView(discord.ui.View):
+class PollView(ServerOnlyView):
     def __init__(self, n: int = 5, counts: Optional[dict] = None):
         super().__init__(timeout=None)
         counts = counts or {}
@@ -730,9 +735,9 @@ class PollView(discord.ui.View):
             self.add_item(b)
 
 
-# --------------------------------------------------------------------------- #
-# Bot
-# --------------------------------------------------------------------------- #
+
+
+
 class TeatroTree(app_commands.CommandTree):
     async def interaction_check(self, interaction):
         if ALLOWED_GUILD_ID and interaction.guild_id != int(ALLOWED_GUILD_ID):
@@ -807,9 +812,9 @@ async def on_tree_error(interaction: discord.Interaction, error: app_commands.Ap
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-# --------------------------------------------------------------------------- #
-# Autocomplete + resolving titles
-# --------------------------------------------------------------------------- #
+
+
+
 async def title_autocomplete(interaction: discord.Interaction, current: str):
     if len(current) < 2:
         return []
@@ -825,9 +830,14 @@ async def title_autocomplete(interaction: discord.Interaction, current: str):
 async def resolve_movie_id(query: str) -> Optional[int]:
     if query.startswith("id:") and query[3:].isdigit():
         return int(query[3:])
-    data = await bot.api.tmdb("/search/movie", {"query": query, "include_adult": "false"})
-    res = data.get("results", [])
-    return res[0]["id"] if res else None
+    match = re.fullmatch(r"(.+?)\s*\(?((?:19|20)\d{2})\)?", query.strip())
+    title, year = (match.group(1).strip(), match.group(2)) if match else (query.strip(), None)
+    data = await bot.api.tmdb("/search/movie", {"query": title, "include_adult": "false"})
+    results = data.get("results", [])
+    if year:
+        results = [m for m in results if (m.get("release_date") or "")[:4] == year]
+    exact = [m for m in results if m.get("title", "").casefold() == title.casefold()]
+    return (exact or results)[0]["id"] if results else None
 
 
 async def platform_autocomplete(interaction: discord.Interaction, current: str):
@@ -843,9 +853,9 @@ DECADE_CHOICES = [app_commands.Choice(name=f"{y}s", value=str(y)) for y in range
 MODE_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in MODE_LABELS.items()]
 
 
-# --------------------------------------------------------------------------- #
-# Slash commands: admin
-# --------------------------------------------------------------------------- #
+
+
+
 @bot.tree.command(name="setup", description="Set the channel (and optional ping role) for the daily film")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
@@ -895,9 +905,9 @@ async def rolepanel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=emb, view=RoleView())
 
 
-# --------------------------------------------------------------------------- #
-# Slash commands: films
-# --------------------------------------------------------------------------- #
+
+
+
 @bot.tree.command(name="film", description="Get a good film recommendation")
 @app_commands.checks.cooldown(1, 10, key=lambda i: (i.guild_id, i.user.id))
 @app_commands.guild_only()
@@ -950,7 +960,7 @@ search_cmd.autocomplete("title")(title_autocomplete)
 
 
 def theatrical_dates(movie: dict) -> list[date]:
-    """Regional theatrical dates, including re-releases, without unrelated releases."""
+    """Get the movie's theatrical dates for the selected region."""
     dates = set()
     for region in movie.get("release_dates", {}).get("results", []):
         if region.get("iso_3166_1") != REGION:
@@ -991,8 +1001,8 @@ async def cinema_embed(title: str, gte: date, lte: date, by_date: bool) -> disco
         rating = f"⭐ {d['vote_average']:.1f} · " if d.get("vote_average") and d.get("vote_count", 0) >= 50 else ""
         release = a["cinema_date"]
         label = "re-release" if a["rerelease"] else "opens" if release >= today() else "opened"
-        # Release dates are calendar dates; avoid shifting them into another day
-        # when Discord renders a midnight timestamp in a viewer's timezone.
+
+
         when = f"{label} {release:%d %b %Y}"
         genres = ", ".join(g["name"] for g in d.get("genres", [])[:2])
         lines.append(f"**[{d['title']}](https://www.themoviedb.org/movie/{d['id']})** · {rating}{genres}\n{when}")
@@ -1011,13 +1021,109 @@ async def nowplaying(interaction: discord.Interaction):
                                                              t - timedelta(days=45), t, by_date=False))
 
 
-@bot.tree.command(name="comingsoon", description="Films coming to cinemas in the next 60 days")
+def upcoming_release(movie: dict, start: date, end: date):
+    """Get release details for a new movie in the given date range."""
+    if movie.get('status') == 'Released' or movie.get('adult'):
+        return None
+    try:
+        primary = date.fromisoformat(movie.get('release_date') or '')
+    except ValueError:
+        return None
+    if not start <= primary <= end:
+        return None
+
+    for region in movie.get('release_dates', {}).get('results', []):
+        for release in region.get('release_dates', []):
+            if release.get('type') not in (2, 3):
+                continue
+            try:
+                if date.fromisoformat((release.get('release_date') or '')[:10]) < start:
+                    return None
+            except ValueError:
+                continue
+    local = [d for d in theatrical_dates(movie) if start <= d <= end]
+    return (local[0], f'{REGION} theatrical date') if local else (primary, f'Listed release · {REGION} date unconfirmed')
+
+
+async def upcoming_embed(start: date, end: date, page: int, sort: str) -> discord.Embed:
+    data = await bot.api.tmdb('/discover/movie', {
+        'primary_release_date.gte': str(start), 'primary_release_date.lte': str(end),
+        'include_adult': 'false', 'sort_by': sort, 'page': page,
+    })
+    details = await asyncio.gather(*(bot.api.details(m['id']) for m in data.get('results', [])[:20]))
+    lines = []
+    for movie in details:
+        result = upcoming_release(movie, start, end)
+        if not result or not movie.get('id'):
+            continue
+        release, label = result
+        title = discord.utils.escape_markdown(trunc(movie.get('title'), 65))
+        lines.append(f"**[{title}](https://www.themoviedb.org/movie/{movie['id']})**\n{release:%d %b %Y} · {label}")
+    embed = discord.Embed(title='📅 Upcoming new movies', color=discord.Color.red(),
+        description='\n\n'.join(lines) or 'No unreleased films with confirmed listed dates on this page. Try another page or a longer window.')
+    embed.set_footer(text=f"TMDB · Page {page}/{max(1, data.get('total_pages', 1))} · {start:%d %b %Y}–{end:%d %b %Y} · {TZ.key} · Dates may change")
+    return embed
+
+
+def regional_future_screening(movie: dict, start: date, end: date):
+    """Find a future local cinema date for an older movie."""
+    if movie.get('adult'):
+        return None
+    try:
+        original = date.fromisoformat(movie.get('release_date') or '')
+    except ValueError:
+        return None
+    if original >= start:
+        return None
+    all_dates = theatrical_dates(movie)
+    dates = [day for day in all_dates if start <= day <= end]
+    if not dates:
+        return None
+    kind = 'Re-release' if all_dates[0] < start else f'First {REGION} theatrical listing'
+    return min(dates), kind
+
+
+async def rereleases_embed(start: date, end: date, page: int):
+    data = await bot.api.tmdb('/discover/movie', {
+        'region': REGION, 'with_release_type': '2|3',
+        'release_date.gte': str(start), 'release_date.lte': str(end),
+        'primary_release_date.lte': str(start - timedelta(days=1)),
+        'include_adult': 'false', 'sort_by': 'popularity.desc', 'page': page,
+    })
+    details = await asyncio.gather(*(bot.api.details(m['id']) for m in data.get('results', [])[:20]))
+    rows = []
+    for movie in details:
+        screening = regional_future_screening(movie, start, end)
+        if screening and movie.get('id'):
+            release, kind = screening
+            title = discord.utils.escape_markdown(trunc(movie.get('title'), 65))
+            rows.append((release, f"**{title}** · {release:%d %b %Y} · {kind}\n[TMDB release details](https://www.themoviedb.org/movie/{movie['id']}/releases)"))
+    if not rows:
+        return None
+    rows.sort(key=lambda row: row[0])
+    embed = discord.Embed(title=f'🎞️ Additional theatrical listings for {REGION}', color=discord.Color.orange(),
+        description='Future regional theatrical dates recorded by TMDB. Check the cinema for confirmed screenings.\n\n' + '\n\n'.join(row[1] for row in rows[:15]))
+    embed.set_footer(text=f'TMDB regional theatrical records · Page {page} · Check the cinema before planning a visit')
+    return embed
+
+
+@bot.tree.command(name="comingsoon", description="Upcoming new films and separately labeled regional theatrical listings")
 @app_commands.guild_only()
-async def comingsoon(interaction: discord.Interaction):
+@app_commands.describe(months="Look ahead 1–60 months (default: 24)", page="Browse more results", sort="Popular upcoming films or soonest releases")
+@app_commands.choices(sort=[app_commands.Choice(name='Most anticipated', value='popularity.desc'),
+                           app_commands.Choice(name='Soonest releases', value='primary_release_date.asc')])
+async def comingsoon(interaction: discord.Interaction, months: app_commands.Range[int, 1, 60] = 24,
+                     page: app_commands.Range[int, 1, 500] = 1, sort: str = 'popularity.desc'):
     await interaction.response.defer()
-    t = today()
-    await interaction.followup.send(embed=await cinema_embed(f"📅 Coming soon to {REGION} cinemas",
-                                                             t, t + timedelta(days=60), by_date=True))
+    start = today()
+    import calendar
+    total = start.year * 12 + start.month - 1 + months
+    year, month = divmod(total, 12)
+    end = date(year, month + 1, min(start.day, calendar.monthrange(year, month + 1)[1]))
+    await interaction.followup.send(embed=await upcoming_embed(start, end, page, sort))
+    rereleases = await rereleases_embed(start, end, page)
+    if rereleases:
+        await interaction.followup.send(embed=rereleases)
 
 
 @bot.tree.command(name="person", description="Top films from a director or actor")
@@ -1046,7 +1152,7 @@ async def person_cmd(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=emb)
 
 
-# ---- watchlist ------------------------------------------------------------- #
+
 watchlist = app_commands.Group(name="watchlist", description="The server's shared watchlist", guild_only=True)
 
 
@@ -1108,8 +1214,8 @@ wl_add.autocomplete("title")(title_autocomplete)
 bot.tree.add_command(watchlist)
 
 
-# ---- personal streaming services ------------------------------------------- #
-class ServicesView(discord.ui.View):
+
+class ServicesView(ServerOnlyView):
     def __init__(self, providers: list[tuple[int, str]], current: set[int]):
         super().__init__(timeout=300)
         self.visible = {pid for pid, _ in providers[:25]}
@@ -1148,8 +1254,8 @@ async def myservices(interaction: discord.Interaction, search: Optional[str] = N
         view=ServicesView(provs, cur), ephemeral=True)
 
 
-# ---- movie night poll ------------------------------------------------------ #
-# ---- leaderboard + recap --------------------------------------------------- #
+
+
 async def leaderboard_rows(guild_id: int, start: str, end: str, limit: int = 10):
     return await q_all(
         "SELECT v.tmdb_id, (SELECT title FROM posts p WHERE p.tmdb_id=v.tmdb_id LIMIT 1) AS title, "
@@ -1201,7 +1307,7 @@ async def recap(interaction: discord.Interaction):
         interaction.guild_id, start, n + timedelta(minutes=1), f"📆 {n.strftime('%B %Y')} so far"))
 
 
-# ---- trivia ---------------------------------------------------------------- #
+
 def mask_title(text: str, title: str) -> str:
     text = re.sub(re.escape(title), "▇▇▇", text, flags=re.I)
     for w in re.findall(r"\w{4,}", title):
@@ -1240,7 +1346,7 @@ class GuessModal(discord.ui.Modal, title="Guess the film"):
             await interaction.response.send_message(f"❌ Not quite. {3 - used - 1} guess(es) left.", ephemeral=True)
 
 
-class TriviaView(discord.ui.View):
+class TriviaView(ServerOnlyView):
     def __init__(self, answer: str, full_title: str, poster: Optional[str]):
         super().__init__(timeout=600)
         self.answer, self.full_title, self.poster = answer, full_title, poster
@@ -1291,9 +1397,9 @@ async def trivia(interaction: discord.Interaction):
     view.message = await interaction.followup.send(embed=emb, view=view, wait=True)
 
 
-# --------------------------------------------------------------------------- #
-# Scheduled jobs
-# --------------------------------------------------------------------------- #
+
+
+
 async def run_release_alerts():
     rows = await q_all("SELECT guild_id, tmdb_id, title, GROUP_CONCAT(user_id) users FROM watchlist "
                        "GROUP BY guild_id, tmdb_id")
@@ -1345,11 +1451,11 @@ async def run_daily_jobs():
                     continue
                 await run("INSERT OR IGNORE INTO job_runs VALUES(?,?)", (s["guild_id"], str(t)))
             channel = bot.get_channel(s["channel_id"])
-            if channel and t.weekday() == 4 and not await q_one("SELECT 1 FROM job_parts WHERE guild_id=? AND day=? AND kind='cinema'", (s["guild_id"], str(t))):  # Friday: what's new in cinemas
+            if channel and t.weekday() == 4 and not await q_one("SELECT 1 FROM job_parts WHERE guild_id=? AND day=? AND kind='cinema'", (s["guild_id"], str(t))):
                 await channel.send(embed=await cinema_embed(
                     f"🎟️ New in {REGION} cinemas this week", t - timedelta(days=3), t + timedelta(days=7), by_date=True))
                 await run("INSERT OR IGNORE INTO job_parts VALUES(?,?,'cinema')", (s["guild_id"], str(t)))
-            if channel and t.day == 1 and not await q_one("SELECT 1 FROM job_parts WHERE guild_id=? AND day=? AND kind='recap'", (s["guild_id"], str(t))):  # 1st of the month: recap of last month
+            if channel and t.day == 1 and not await q_one("SELECT 1 FROM job_parts WHERE guild_id=? AND day=? AND kind='recap'", (s["guild_id"], str(t))):
                 end = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
                 start = (end - timedelta(days=1)).replace(day=1)
                 await channel.send(embed=await recap_embed(
@@ -1368,8 +1474,23 @@ async def _before_daily():
     await bot.wait_until_ready()
 
 
-# --------------------------------------------------------------------------- #
+
 if __name__ == "__main__":
+
+    os.umask(0o077)
+    if os.getenv("REQUIRE_GUILD_ALLOWLIST") == "1" and not ALLOWED_GUILD_ID:
+        raise SystemExit("Set ALLOWED_GUILD_ID to your Discord server ID before cloud startup.")
+    if ALLOWED_GUILD_ID and (not ALLOWED_GUILD_ID.isdigit() or int(ALLOWED_GUILD_ID) <= 0):
+        raise SystemExit("ALLOWED_GUILD_ID must be a positive server ID.")
+    if DEV_GUILD_ID and ALLOWED_GUILD_ID and DEV_GUILD_ID != ALLOWED_GUILD_ID:
+        raise SystemExit("GUILD_ID and ALLOWED_GUILD_ID must match for this personal bot.")
+
+    import fcntl
+    database_lock = open(DB_PATH + ".lock", "a")
+    try:
+        fcntl.flock(database_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("Another Teatro process is already using this database.")
     missing = [k for k, v in {"DISCORD_TOKEN": TOKEN, "TMDB_API_KEY": TMDB_KEY}.items() if not v]
     if missing:
         raise SystemExit(f"Missing in .env: {', '.join(missing)}")

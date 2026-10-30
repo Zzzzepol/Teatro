@@ -1,4 +1,4 @@
-"""Offline regression tests; no Discord token or network required."""
+"""Test Teatro without connecting to Discord."""
 import unittest
 from datetime import date, timedelta
 from types import SimpleNamespace
@@ -145,6 +145,59 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         for excluded in ('Past only','Too late','Digital only','Wrong region','Invalid date','2024'):
             self.assertNotIn(excluded, embed.description)
         self.assertLess(embed.description.index('Today film'), embed.description.index('Returning film'))
+
+    async def test_upcoming_excludes_old_films_even_with_future_ph_dates(self):
+        start, end = date(2026,10,30), date(2028,10,30)
+        def film(primary, status='Post Production', historical=None):
+            regions = [{'iso_3166_1': core.REGION, 'release_dates': [
+                {'type': 3, 'release_date': '2026-11-11T00:00:00Z'}]}]
+            if historical:
+                regions.append({'iso_3166_1': 'US', 'release_dates': [
+                    {'type': 3, 'release_date': historical}]})
+            return {'release_date': primary, 'status': status, 'release_dates': {'results': regions}}
+        self.assertIsNone(core.upcoming_release(film('2021-09-15'), start, end))
+        self.assertIsNone(core.upcoming_release(film('2024-02-28'), start, end))
+        self.assertIsNone(core.upcoming_release(film('2026-12-18', 'Released'), start, end))
+        self.assertIsNone(core.upcoming_release(film('2026-12-18', historical='2024-02-28'), start, end))
+        self.assertIsNone(core.upcoming_release(film(''), start, end))
+        self.assertIsNone(core.upcoming_release(film('2029-01-01'), start, end))
+        self.assertEqual(core.upcoming_release(film('2026-11-11'), start, end)[0], date(2026,11,11))
+        distant = {'release_date': '2028-07-01', 'status': 'In Production'}
+        self.assertEqual(core.upcoming_release(distant, start, end),
+                         (date(2028,7,1), f'Listed release · {core.REGION} date unconfirmed'))
+
+    async def test_upcoming_browses_pages_without_requiring_ph_dates(self):
+        movies = [{'id': 1, 'title': 'Old movie', 'release_date': '2024-01-01'},
+                  {'id': 2, 'title': 'Future sequel', 'release_date': '2027-12-01'}]
+        api = SimpleNamespace(tmdb=AsyncMock(return_value={'results':movies,'total_pages':3}),
+                              details=AsyncMock(side_effect=movies))
+        with patch.object(core, 'bot', SimpleNamespace(api=api)):
+            embed = await core.upcoming_embed(date(2026,10,30), date(2028,10,30), 2, 'popularity.desc')
+        self.assertNotIn('Old movie', embed.description)
+        self.assertIn('Future sequel', embed.description)
+        self.assertIn('date unconfirmed', embed.description)
+        self.assertIn('Page 2/3', embed.footer.text)
+        params = api.tmdb.call_args.args[1]
+        self.assertEqual(params['page'], 2)
+        self.assertNotIn('region', params)
+        self.assertEqual(params['primary_release_date.gte'], '2026-10-30')
+
+    async def test_rerelease_requires_regional_theatrical_evidence(self):
+        start, end = date(2026,10,30), date(2028,10,30)
+        movie = {'release_date': '2024-02-28', 'status': 'Released'}
+        self.assertIsNone(core.regional_future_screening(movie, start, end))
+        region = {'iso_3166_1': 'ZZ', 'release_dates': [{'type':3,'release_date':'2026-11-11'}]}
+        movie['release_dates'] = {'results': [region]}
+        self.assertIsNone(core.regional_future_screening(movie, start, end))
+        region['iso_3166_1'] = core.REGION
+        self.assertEqual(core.regional_future_screening(movie, start, end), (date(2026,11,11), f'First {core.REGION} theatrical listing'))
+        region['release_dates'].insert(0, {'type':3,'release_date':'2024-02-28'})
+        self.assertEqual(core.regional_future_screening(movie, start, end), (date(2026,11,11), 'Re-release'))
+        region['release_dates'].pop(0)
+        region['release_dates'][0]['type'] = 4
+        self.assertIsNone(core.regional_future_screening(movie, start, end))
+        region['release_dates'][0] = {'type':3,'release_date':'2024-02-28'}
+        self.assertIsNone(core.regional_future_screening(movie, start, end))
 
     async def test_register_workflow_commands(self):
         bot=core.FilmBot()

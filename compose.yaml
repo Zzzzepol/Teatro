@@ -1,0 +1,28 @@
+services:
+  teatro:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      DB_PATH: /data/filmclub.db
+      REQUIRE_GUILD_ALLOWLIST: '1'
+    volumes:
+      - teatro-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 64
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: '5m'
+        max-file: '3'
+volumes:
+  teatro-data:
