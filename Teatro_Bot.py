@@ -44,7 +44,7 @@ MIN_VOTES = 1000
 ROTATION = {0: "streaming", 1: "hidden", 2: "streaming", 3: "classic",
             4: "cinema", 5: "streaming", 6: "filipino"}
 
-MODE_LABELS = {"streaming": "Streaming pick", "cinema": "In cinemas", "hidden": "Hidden gem",
+MODE_LABELS = {"streaming": "Streaming pick", "cinema": "Recent theatrical release", "hidden": "Hidden gem",
                "classic": "Classic", "filipino": "Filipino spotlight", "any": "Random pick"}
 
 GENRES = {"Action": 28, "Adventure": 12, "Animation": 16, "Comedy": 35, "Crime": 80,
@@ -245,6 +245,9 @@ def analyze(d: dict) -> dict:
                     continue
                 if cdate is None or dt < cdate:
                     cdate = dt
+    dates = theatrical_dates(d)
+    past = [day for day in dates if day <= t]
+    cdate = max(past) if past else min(dates) if dates else None
     status = None
     if cdate:
         if cdate > t:
@@ -442,8 +445,16 @@ async def pick_film(guild_id: Optional[int], params: dict, exclude=()) -> Option
         page = random.randint(1, total)
         data = first if page == 1 else await bot.api.tmdb("/discover/movie", {**params, "page": page})
         pool = [m for m in data.get("results", []) if m["id"] not in seen and m.get("poster_path") and (not mood_genres or mood_genres.intersection(m.get("genre_ids", [])))]
-        if pool:
-            return random.choice(pool)["id"]
+        random.shuffle(pool)
+        for movie in pool:
+            if params.get('with_release_type'):
+                details = await bot.api.details(movie['id'])
+                lower = date.fromisoformat(params['release_date.gte'])
+                upper = date.fromisoformat(params['release_date.lte'])
+                if not any(lower <= day <= upper for day in theatrical_dates(details)):
+                    seen.add(movie['id'])
+                    continue
+            return movie['id']
     return None
 
 
@@ -765,6 +776,8 @@ class FilmBot(commands.Bot):
         await install(self, __import__(__name__))
         from teatro_members import install as install_members
         await install_members(self, __import__(__name__))
+        from teatro_series import install as install_series
+        await install_series(self, __import__(__name__))
         self.add_view(FilmView())
         self.add_view(RoleView())
         self.add_view(PollView())
@@ -779,6 +792,12 @@ class FilmBot(commands.Bot):
 
     async def close(self):
         daily_job.cancel()
+        if hasattr(self, "series_task"):
+            self.series_task.cancel()
+            try:
+                await self.series_task
+            except asyncio.CancelledError:
+                pass
         if hasattr(self, "workflow_task"):
             self.workflow_task.cancel()
             try:
@@ -800,6 +819,8 @@ async def on_ready():
 
 @bot.tree.error
 async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if interaction.extras.get('teatro_error_handled'):
+        return
     log.exception("Command error", exc_info=error)
     msg = "Something went wrong. Please try again in a moment."
     if isinstance(error, app_commands.CommandOnCooldown):
@@ -827,12 +848,14 @@ async def title_autocomplete(interaction: discord.Interaction, current: str):
     return out
 
 
-async def resolve_movie_id(query: str) -> Optional[int]:
+async def resolve_movie_id(query: str, *, report_unavailable: bool = False) -> Optional[int]:
     if query.startswith("id:") and query[3:].isdigit():
         return int(query[3:])
     match = re.fullmatch(r"(.+?)\s*\(?((?:19|20)\d{2})\)?", query.strip())
     title, year = (match.group(1).strip(), match.group(2)) if match else (query.strip(), None)
     data = await bot.api.tmdb("/search/movie", {"query": title, "include_adult": "false"})
+    if report_unavailable and 'results' not in data:
+        raise ValueError('TMDB search is temporarily unavailable. Please try again shortly.')
     results = data.get("results", [])
     if year:
         results = [m for m in results if (m.get("release_date") or "")[:4] == year]
@@ -1238,18 +1261,24 @@ class ServicesView(ServerOnlyView):
 @bot.tree.command(name="myservices", description="Tell me which streaming services you have")
 @app_commands.describe(search="Search a streaming service, such as Disney or Max; repeat to add more")
 async def myservices(interaction: discord.Interaction, search: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
     provs = await bot.api.providers()
+    if hasattr(bot, 'series'):
+        television = await bot.series.cached('/watch/providers/tv', {'watch_region': REGION, 'language': 'en-US'})
+        merged = dict(provs)
+        merged.update((p['provider_id'], p['provider_name']) for p in television.get('results', []))
+        provs = sorted(merged.items(), key=lambda item: item[1].casefold())
     if not provs:
-        return await interaction.response.send_message("Couldn't load the streaming service list. Try again later.", ephemeral=True)
+        return await interaction.followup.send("Couldn't load the streaming service list. Try again later.", ephemeral=True)
     row = await q_one("SELECT provider_ids FROM services WHERE user_id=?", (interaction.user.id,))
     cur = set(json.loads(row["provider_ids"])) if row else set()
     if search:
         matches = [(pid, name) for pid, name in provs if search.casefold() in name.casefold()]
         if not matches:
-            return await interaction.response.send_message(
-                f"No movie provider matching **{trunc(search, 40)}** was returned for {REGION}. Try another name, such as Max, HBO, or Disney.", ephemeral=True)
+            return await interaction.followup.send(
+                f"No provider matching **{trunc(search, 40)}** was returned for {REGION}. Try another name, such as Max, HBO, or Disney.", ephemeral=True)
         provs = matches
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "Select the services you use, then submit. Use `/myservices search:Disney` or `/myservices search:Max` for providers beyond the first page; earlier selections stay saved.",
         view=ServicesView(provs, cur), ephemeral=True)
 
@@ -1465,6 +1494,7 @@ async def run_daily_jobs():
             log.exception("Daily job failed for guild %s", s["guild_id"])
     try:
         await run_release_alerts()
+        bot.last_release_check = now_iso()
     except Exception:
         log.exception("Release alerts failed")
 

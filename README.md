@@ -1,5 +1,7 @@
 # Teatro
 
+Recent improvements: daily cinema picks validate regional theatrical dates and are labeled as recent releases, not verified showtimes. `/movienight edit max_runtime:210` changes nomination settings without recreating the night. Platform, language, and voice channel can also be changed or cleared while nominations are open; conflicting nominations prevent the edit. `/movienight status` displays these settings. Select `voice_channel` in `/movienight create` or `/movienight edit` to create a voice-channel event; grant the bot View Channel and Connect there. `/admin status` is private to members with Manage Server and shows the posting schedule, active night, last release scan since restart, workers and missing permissions. Restart the bot to sync the new commands. Existing nights migrate automatically with no voice channel selected.
+
 A Python Discord film-club bot with recommendations, watchlists and persistent movie nights.
 
 ## Local setup
@@ -52,7 +54,7 @@ Daily picks catch up for the current day after downtime and avoid repeat sends a
 ## Validation
 
 ```sh
-.venv/bin/python -m unittest tests_teatro -v
+.venv/bin/python -m unittest tests_teatro tests_series -v
 ```
 
 Tests are offline and cover migration, filters, alert retry, daily deduplication, winner persistence, event recovery, nomination validation and command registration. Live Discord/API behavior still requires a test server and credentials.
@@ -73,3 +75,20 @@ Tests are offline and cover migration, filters, alert retry, daily deduplication
 Recommendations currently use genre/language/runtime rules, watched history and a 180-day server repeat window. Group service coverage is informational; the poll winner remains the members' vote. More Like This uses genre similarity, not an AI model. Theme changes are manual. Annual recaps use current stored records, not an immutable watch diary. Trivia rounds themselves are not restored after restart, but scores are persistent. The existing legacy core is retained while movie-night and member features are separate modules.
 
 Hosting and deployment are intentionally deferred.
+
+## Daily series and episode charts
+
+Series are an optional extra alongside films. Update dependencies with `.venv/bin/pip install -r requirements.txt`, then restart the bot so it registers the new commands. The existing TMDB key is sufficient.
+
+- `/series title:Game of Thrones`: a series card with synopsis, cast, creators, genres, episode length, status, regional watch providers and an episode-rating chart. Omit the title for a recommendation.
+- `/seriessetup channel:#series daily_time:18:00`: enable daily series picks in that channel using the configured timezone (Asia/Manila by default). Add `role:@SeriesClub` for optional pings; use `enabled:False` to pause. This schedule is independent of daily films. If today's time has passed, the next scheduler check posts today's pick.
+- `/seriesdaily`: admin-only immediate daily pick, at most one completed post per server per local day.
+- `/seriesnotifications enabled:True`: join the configured series ping role; use False to leave. Use a separate role from FilmClub if members should control film and series pings independently.
+- `/seriesratings title:Game of Thrones`: open the chart separately. `season_page:2` shows the next eight seasons; `episode_page:2` shows episodes 31–60. Specials are excluded.
+- `/serieswatchlist view` and `/serieswatchlist remove`: manage your private saved series. Cards have Loved it, Meh, Not for me, Seen it, Watchlist, Can I watch?, and Episode ratings buttons, plus trailer, IMDb and provider links when available.
+
+Grant View Channel, Send Messages, Embed Links and Attach Files in the series channel. Optional ping roles must be below Teatro's highest role, with Manage Roles enabled. `/admin status` shows the series schedule and worker state.
+
+The colored grid uses TMDB community episode ratings, not IMDb scores. It includes a poster when available, a numeric color legend and season averages calculated from rated, aired episodes. Unrated, undated and future episodes display N/A; blank cells mean no episode. Chart pages contain up to eight seasons and thirty episode rows. When episode data is unavailable, the text card still posts with an explanation. Streaming information comes from TMDB/JustWatch for REGION and may vary by season; it is not a guarantee of current access.
+
+Series ratings, watched history and watchlists are stored separately from films and are included in `/delete-my-data`. Daily suggestions avoid series posted in the previous 180 days; personal random suggestions also skip your watched series. Film preferences and movie-night nominations continue to apply to films. Run one bot process per database; a crash between a Discord send and the database commit can still cause a duplicate.

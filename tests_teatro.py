@@ -1,8 +1,9 @@
 """Test Teatro without connecting to Discord."""
 import unittest
+import asyncio
 from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import aiosqlite
 import Teatro_Bot as core
 from teatro_workflows import migrate, Nights, install
@@ -198,6 +199,58 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(core.regional_future_screening(movie, start, end))
         region['release_dates'][0] = {'type':3,'release_date':'2024-02-28'}
         self.assertIsNone(core.regional_future_screening(movie, start, end))
+
+    async def test_cinema_picker_rejects_stale_regional_details(self):
+        api=SimpleNamespace(tmdb=AsyncMock(return_value={'results':[{'id':1,'poster_path':'/p'}],'total_pages':1}),details=AsyncMock(return_value={'id':1,'release_dates':{'results':[{'iso_3166_1':core.REGION,'release_dates':[{'type':3,'release_date':'2024-01-01'}]}]}}))
+        with patch.object(core,'bot',SimpleNamespace(api=api)):
+            result=await core.pick_film(None,{'with_release_type':'2|3','release_date.gte':'2026-10-01','release_date.lte':'2026-10-30'})
+        self.assertIsNone(result)
+
+    async def test_failed_search_is_distinct_from_no_match(self):
+        api=SimpleNamespace(tmdb=AsyncMock(return_value={}))
+        with patch.object(core,'bot',SimpleNamespace(api=api)):
+            with self.assertRaisesRegex(ValueError,'temporarily unavailable'):
+                await core.resolve_movie_id('Oppenheimer',report_unavailable=True)
+            api.tmdb.return_value={'results':[]}
+            self.assertIsNone(await core.resolve_movie_id('Unknown',report_unavailable=True))
+
+    async def test_movie_night_edit_preserves_nominations_and_rejects_conflicts(self):
+        bot=core.FilmBot()
+        await bot._async_setup_hook()
+        await install(bot,core)
+        bot.api=SimpleNamespace(details=AsyncMock(return_value={'id':100,'title':'Film','runtime':181}))
+        await core.run("INSERT INTO nights(id,guild_id,host_id,state,max_runtime) VALUES(1,1,10,'nominating',180)")
+        await core.run("INSERT INTO nominations VALUES(1,100,'Film',10,181)")
+        i=SimpleNamespace(guild_id=1,user=SimpleNamespace(id=10,guild_permissions=SimpleNamespace(manage_guild=True)),response=SimpleNamespace(defer=AsyncMock()),followup=SimpleNamespace(send=AsyncMock()))
+        try:
+            command=bot.tree.get_command('movienight').get_command('edit')
+            await command.callback(i,max_runtime=210)
+            self.assertEqual((await core.q_one('SELECT max_runtime FROM nights WHERE id=1'))['max_runtime'],210)
+            with self.assertRaisesRegex(ValueError,'Settings unchanged'):
+                await command.callback(i,max_runtime=120)
+            self.assertEqual((await core.q_one('SELECT max_runtime FROM nights WHERE id=1'))['max_runtime'],210)
+            self.assertEqual((await core.q_one('SELECT COUNT(*) n FROM nominations'))['n'],1)
+        finally:
+            bot.workflow_task.cancel()
+            try:await bot.workflow_task
+            except asyncio.CancelledError:pass
+            await core.commands.Bot.close(bot)
+
+    async def test_voice_event_uses_selected_channel(self):
+        start=(self.service.now()+timedelta(days=1)).isoformat()
+        await core.run("INSERT INTO nights(id,guild_id,channel_id,state,start,winner,voice_channel_id) VALUES(1,1,2,'scheduling',?,100,3)",(start,))
+        await core.run("INSERT INTO nominations VALUES(1,100,'Film',10,90)")
+        voice=Mock(spec=core.discord.VoiceChannel)
+        guild=SimpleNamespace(get_channel=lambda _:voice,fetch_scheduled_events=AsyncMock(return_value=[]),create_scheduled_event=AsyncMock(return_value=SimpleNamespace(id=55,url='https://discord.com/events/1/55')))
+        service=Nights(SimpleNamespace(get_guild=lambda _:guild),core)
+        service.announce=AsyncMock()
+        await service.schedule(await service.active(1))
+        options=guild.create_scheduled_event.call_args.kwargs
+        self.assertEqual(options['entity_type'],core.discord.EntityType.voice)
+        self.assertIs(options['channel'],voice)
+        self.assertNotIn('location',options)
+        await migrate(core.DB)
+        self.assertEqual((await service.active(1))['voice_channel_id'],3)
 
     async def test_register_workflow_commands(self):
         bot=core.FilmBot()

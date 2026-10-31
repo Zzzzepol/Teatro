@@ -26,6 +26,9 @@ CREATE INDEX IF NOT EXISTS ratings_movie ON ratings(guild_id,tmdb_id);
 
 async def migrate(db):
     await db.executescript(SCHEMA)
+    columns = await (await db.execute('PRAGMA table_info(nights)')).fetchall()
+    if 'voice_channel_id' not in {row[1] for row in columns}:
+        await db.execute('ALTER TABLE nights ADD COLUMN voice_channel_id INTEGER')
     if not await (await db.execute('SELECT 1 FROM migrations WHERE version=1')).fetchone():
 
         await db.execute("INSERT OR REPLACE INTO ratings SELECT guild_id,user_id,tmdb_id,vote,created_at FROM votes WHERE vote!='seen' ORDER BY created_at,message_id")
@@ -51,10 +54,12 @@ class Nights:
         raise ValueError('You need Manage Server, the Movie Host role, or ownership of this movie night.')
 
     async def eligible(self, night, movie):
-        if not movie.get('id') or movie.get('adult'):
-            raise ValueError('Movie not found in TMDB or excluded as adult. Select a title from autocomplete and try again.')
+        if not movie.get('id'):
+            raise ValueError('Movie details could not be loaded from TMDB. Try again shortly.')
+        if movie.get('adult'):
+            raise ValueError('This movie is marked adult in TMDB and is excluded.')
         if not movie.get('runtime') or movie['runtime'] > night['max_runtime']:
-            raise ValueError(f"This film runs {movie.get('runtime') or 'an unknown number of'} minutes; this night allows at most {night['max_runtime']} minutes. A host can create a new night with a higher max_runtime.")
+            raise ValueError(f"This film runs {movie.get('runtime') or 'an unknown number of'} minutes; this night allows at most {night['max_runtime']} minutes. A host can use /movienight edit while nominations are open.")
         if night['language'] and movie.get('original_language') != night['language']:
             raise ValueError('This film does not match the selected language.')
         if night['platform'] and int(night['platform']) not in {p for p, _ in self.c.analyze(movie)['flat']}:
@@ -94,9 +99,15 @@ class Nights:
         events = await guild.fetch_scheduled_events()
         event = next((e for e in events if e.description == marker), None)
         if event is None:
+            options = {'entity_type': discord.EntityType.external, 'location': f"https://discord.com/channels/{night['guild_id']}/{night['channel_id']}"}
+            if night['voice_channel_id']:
+                voice = guild.get_channel(night['voice_channel_id'])
+                if not isinstance(voice, discord.VoiceChannel):
+                    raise ValueError('The selected voice channel no longer exists.')
+                options = {'entity_type': discord.EntityType.voice, 'channel': voice}
             event = await guild.create_scheduled_event(name=f"Teatro: {winner['title']}"[:100], description=marker,
                 start_time=start,end_time=start+timedelta(minutes=winner['runtime'] or 120),
-                entity_type=discord.EntityType.external,location=f"Discord channel {night['channel_id']}",privacy_level=discord.PrivacyLevel.guild_only)
+                privacy_level=discord.PrivacyLevel.guild_only, **options)
         await self.c.run("UPDATE nights SET state='scheduled',event_id=? WHERE id=?",(event.id,night['id']))
         await self.announce(night, f"🎬 **{winner['title']}** won! <t:{int(start.timestamp())}:F>\n{event.url}\nUse `/movienight rsvp` to opt in to reminders.")
 
@@ -156,9 +167,11 @@ async def install(bot, core):
         return n
 
     @group.command(name='create',description='Host: open nominations; start format YYYY-MM-DD HH:MM in configured timezone')
-    async def create(i:discord.Interaction,start:str,max_runtime:app_commands.Range[int,30,360]=180,platform:str=None,language:str=None):
+    async def create(i:discord.Interaction,start:str,max_runtime:app_commands.Range[int,30,360]=180,platform:str=None,language:str=None,voice_channel:discord.VoiceChannel=None):
         await begin(i)
         await service.require_host(i)
+        if voice_channel and not all((voice_channel.permissions_for(i.guild.me).view_channel, voice_channel.permissions_for(i.guild.me).connect)):
+            raise ValueError('I need View Channel and Connect in the selected voice channel.')
         when = datetime.strptime(start,'%Y-%m-%d %H:%M').replace(tzinfo=core.TZ)
         if when <= service.now()+timedelta(hours=2):
             raise ValueError('Choose a start at least two hours in the future.')
@@ -176,6 +189,8 @@ async def install(bot, core):
                 raise ValueError('This server already has an active movie night.')
             await core.run("INSERT INTO nights(guild_id,channel_id,host_id,state,start,max_runtime,platform,language) VALUES(?,?,?,'nominating',?,?,?,?)",(i.guild_id,i.channel_id,i.user.id,when.isoformat(),max_runtime,platform,language))
             n=await active(i)
+            if voice_channel:
+                await core.run('UPDATE nights SET voice_channel_id=? WHERE id=?',(voice_channel.id,n['id']))
         await service.announce(n,f"🎬 Movie night #{n['id']} planned for <t:{int(when.timestamp())}:F>. Nominate with `/movienight nominate`. Maximum runtime: {max_runtime} minutes.")
         await i.followup.send('Nominations are open. Use `/movienight openvote` when ready.',ephemeral=True)
 
@@ -187,7 +202,9 @@ async def install(bot, core):
     @group.command(name='nominate',description='Nominate a film; two nominations per member, twenty total')
     async def nominate(i:discord.Interaction,title:str):
         await begin(i)
-        mid=await core.resolve_movie_id(title)
+        mid=await core.resolve_movie_id(title,report_unavailable=True)
+        if not mid:
+            raise ValueError('No matching title was returned. Choose a movie from autocomplete, or try just its title.')
         movie=await bot.api.details(mid) if mid else {}
         async with service.lock:
             n=await active(i)
@@ -202,6 +219,40 @@ async def install(bot, core):
             await core.run('INSERT INTO nominations VALUES(?,?,?,?,?)',(n['id'],mid,movie['title'][:100],i.user.id,movie['runtime']))
         await i.followup.send(f"Nominated **{movie['title']}**.",ephemeral=True)
     nominate.autocomplete('title')(core.title_autocomplete)
+
+    @group.command(name='edit',description='Host: change settings while nominations are open')
+    async def edit(i:discord.Interaction,max_runtime:app_commands.Range[int,30,360]=None,platform:str=None,language:str=None,voice_channel:discord.VoiceChannel=None,clear_platform:bool=False,clear_language:bool=False,clear_voice:bool=False):
+        await begin(i)
+        if (platform and clear_platform) or (language and clear_language) or (voice_channel and clear_voice):
+            raise ValueError('Choose a new value or clear it, not both.')
+        if platform and not platform.isdigit():
+            raise ValueError('Choose a service from autocomplete.')
+        if language and language not in core.LANGS.values():
+            raise ValueError('Choose a language from autocomplete.')
+        if voice_channel and not all((voice_channel.permissions_for(i.guild.me).view_channel,voice_channel.permissions_for(i.guild.me).connect)):
+            raise ValueError('I need View Channel and Connect in that voice channel.')
+        async with service.lock:
+            n=await active(i)
+            await service.require_host(i,n)
+            if n['state']!='nominating':
+                raise ValueError('Settings can only change while nominations are open.')
+            proposed=dict(n)
+            proposed['max_runtime']=max_runtime if max_runtime is not None else n['max_runtime']
+            proposed['platform']=None if clear_platform else platform if platform is not None else n['platform']
+            proposed['language']=None if clear_language else language if language is not None else n['language']
+            proposed['voice_channel_id']=None if clear_voice else voice_channel.id if voice_channel else n['voice_channel_id']
+            nominations=await core.q_all('SELECT tmdb_id,title FROM nominations WHERE night_id=?',(n['id'],))
+            for nomination in nominations:
+                movie=await bot.api.details(nomination['tmdb_id'])
+                try:
+                    await service.eligible(proposed,movie)
+                except ValueError as error:
+                    raise ValueError(f"Settings unchanged: {nomination['title']} would fail validation. {error}") from error
+            await core.run('UPDATE nights SET max_runtime=?,platform=?,language=?,voice_channel_id=? WHERE id=?',
+                (proposed['max_runtime'],proposed['platform'],proposed['language'],proposed['voice_channel_id'],n['id']))
+        await i.followup.send(f"Settings saved. Runtime limit: {proposed['max_runtime']} minutes. Existing nominations kept.",ephemeral=True)
+    edit.autocomplete('platform')(core.platform_autocomplete)
+    edit.autocomplete('language')(language_ac)
 
     @group.command(name='openvote',description='Host: close nominations and open a timed vote')
     async def openvote(i:discord.Interaction,minutes:app_commands.Range[int,5,1440]=60):
@@ -254,7 +305,9 @@ async def install(bot, core):
         await begin(i); n=await active(i)
         rows=await core.q_all('SELECT n.title,COUNT(v.user_id) votes FROM nominations n LEFT JOIN night_votes v ON n.night_id=v.night_id AND n.tmdb_id=v.tmdb_id WHERE n.night_id=? GROUP BY n.tmdb_id ORDER BY votes DESC,n.tmdb_id',(n['id'],))
         rsvps=await core.q_all('SELECT status,COUNT(*) n FROM rsvps WHERE night_id=? GROUP BY status',(n['id'],))
-        lines=[f"**{r['title']}** — {r['votes']} vote(s)" for r in rows]
+        lines=[f"Limit: {n['max_runtime']} min · Language: {n['language'] or 'any'} · Provider ID: {n['platform'] or 'any'}",
+               f"Voice channel: <#{n['voice_channel_id']}>" if n['voice_channel_id'] else 'Meeting place: this text channel']
+        lines += [f"**{r['title']}** — {r['votes']} vote(s)" for r in rows]
         attendees=await core.q_all("SELECT r.user_id,s.provider_ids FROM rsvps r LEFT JOIN services s ON s.user_id=r.user_id WHERE r.night_id=? AND r.status='going'",(n['id'],))
         nominations=await core.q_all('SELECT tmdb_id,title FROM nominations WHERE night_id=? ORDER BY tmdb_id',(n['id'],))
         if attendees and nominations:
@@ -329,8 +382,13 @@ async def install(bot, core):
 
     @group.error
     async def error(i,error):
+        i.extras['teatro_error_handled'] = True
         original=getattr(error,'original',error)
         message=str(original) if isinstance(original,ValueError) else 'Could not complete that action. Check permissions and try again.'
+        if isinstance(original,discord.Forbidden):
+            message='Discord denied this action. Check /admin status for missing bot permissions.'
+        elif isinstance(original,app_commands.MissingPermissions):
+            message='You need Manage Server permission for this action.'
         if not isinstance(original,ValueError):log.error('Movie night command failed',exc_info=original)
         if i.response.is_done():await i.followup.send(message,ephemeral=True)
         else:await i.response.send_message(message,ephemeral=True)

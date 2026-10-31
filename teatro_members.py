@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS notifications(guild_id INTEGER,user_id INTEGER,releas
 
     @bot.tree.command(name='help',description='Get started with Teatro')
     async def help_cmd(i:discord.Interaction):
-        await i.response.send_message('🎭 **Welcome to Teatro**\n1. `/myservices` — choose your streaming services.\n2. `/preferences` — set your movie tastes.\n3. `/film` — discover a film; `/search` — find a specific title.\n4. `/watchlist add` — share what you want to watch.\n5. `/movienight status` — join the next movie night.\nUse `/rolepanel` for daily-ping opt-in, `/notifications` for release pings, and `/movienight rsvp` for event reminders. Watchlists are public to your server.',ephemeral=True)
+        await i.response.send_message('🎭 **Welcome to Teatro**\n1. `/myservices` — choose your streaming services.\n2. `/preferences` — set your movie tastes.\n3. `/film` — discover a film; `/search` — find a specific title.\n4. `/watchlist add` — share what you want to watch.\n5. `/movienight status` — join the next movie night.\n6. `/series` — discover a series with cast, synopsis, providers and episode ratings.\n7. `/serieswatchlist view` — your private saved series.\nUse `/rolepanel` for film pings, `/seriesnotifications` for series pings, `/notifications` for release pings, and `/movienight rsvp` for event reminders. `/watchlist` is public; `/mylist` and `/serieswatchlist` are private. Admins can enable daily series with `/seriessetup`.',ephemeral=True)
 
     @bot.tree.command(name='preferences',description='Save preferences used by your personal film recommendations')
     @app_commands.guild_only()
@@ -47,9 +47,48 @@ CREATE TABLE IF NOT EXISTS notifications(guild_id INTEGER,user_id INTEGER,releas
         row=await c.q_one('SELECT MAX(day) day FROM job_runs WHERE guild_id=?',(i.guild_id,))
         await i.response.send_message(f'Database: reachable\nDiscord latency: {bot.latency:.2f}s\nDaily scheduler: {"running" if c.daily_job.is_running() else "stopped"}\nMovie-night worker: {"stopped" if bot.workflow_task.done() else "running"}\nLast daily post: {row["day"] or "none"}',ephemeral=True)
 
+    admin=app_commands.Group(name='admin',description='Server administration',guild_only=True,default_permissions=discord.Permissions(manage_guild=True))
+    @admin.command(name='status',description='Inspect schedule, movie night and permissions')
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def admin_status(i:discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        settings=await c.q_one('SELECT * FROM settings WHERE guild_id=?',(i.guild_id,))
+        controls=await c.q_one('SELECT * FROM controls WHERE guild_id=?',(i.guild_id,))
+        night=await bot.nights.active(i.guild_id)
+        now=c.datetime.now(c.TZ)
+        hour,minute=map(int,controls['daily_time'].split(':')) if controls and controls['daily_time'] else (c.POST_HOUR,c.POST_MIN)
+        next_post=now.replace(hour=hour,minute=minute,second=0,microsecond=0)
+        done=await c.q_one('SELECT 1 FROM job_runs WHERE guild_id=? AND day=?',(i.guild_id,str(now.date())))
+        if done:next_post+=c.timedelta(days=1)
+        if next_post<now:next_post=now
+        channel=i.guild.get_channel(settings['channel_id']) if settings else None
+        role=i.guild.get_role(settings['role_id']) if settings and settings['role_id'] else None
+        missing=[]
+        if channel:
+            permissions=channel.permissions_for(i.guild.me)
+            missing=[name.replace('_',' ') for name in ('view_channel','send_messages','embed_links','create_public_threads','send_messages_in_threads') if not getattr(permissions,name)]
+        else:missing.append('Configured text channel')
+        if settings and settings['role_id'] and (not role or role.managed or role>=i.guild.me.top_role or not i.guild.me.guild_permissions.manage_roles):
+            missing.append('Assignable ping role / Manage Roles')
+        if not i.guild.me.guild_permissions.create_events:missing.append('Create Events')
+        schedule='Paused' if controls and controls['paused'] else f'<t:{int(next_post.timestamp())}:F>' if channel else 'Run /setup first'
+        last=await c.q_one('SELECT MAX(day) day FROM job_runs WHERE guild_id=?',(i.guild_id,))
+        alert=getattr(bot,'last_release_check',None)
+        series_status='Not configured'
+        if hasattr(bot,'series'):
+            series_settings=await c.q_one('SELECT * FROM series_settings WHERE guild_id=?',(i.guild_id,))
+            if series_settings:
+                series_status=f"{'Enabled' if series_settings['enabled'] else 'Paused'} · {series_settings['daily_time']} · <#{series_settings['channel_id']}>"
+        lines=[f"Channel: {channel.mention if channel else 'not configured'}",f"Ping role: {role.mention if role else 'none'}",f"Next daily check: {schedule}",f"Timezone: {c.TZ.key}",f"Last daily post: {last['day'] or 'none'}",f"Movie night: #{night['id']} · {night['state']}" if night else 'Movie night: none',f"Last successful release scan: {alert or 'none since restart'}",f"Daily worker: {'running' if c.daily_job.is_running() else 'stopped'}",f"Movie-night worker: {'stopped' if bot.workflow_task.done() else 'running'}",'Missing permissions: '+(', '.join(missing) or 'none detected')]
+        lines.append('Daily series: '+series_status)
+        if hasattr(bot,'series_task'):
+            lines.append('Series worker: '+('stopped' if bot.series_task.done() else 'running'))
+        await i.followup.send(embed=discord.Embed(title='Teatro admin status',description='\n'.join(lines)),ephemeral=True)
+    bot.tree.add_command(admin)
+
     @bot.tree.command(name='privacy',description='See what Teatro stores')
     async def privacy(i:discord.Interaction):
-        await i.response.send_message('Teatro stores Discord IDs, film preferences, services, watchlists, ratings, watched status, movie-night votes, RSVPs and reviews. Watchlists and posted reviews are visible in the server. It does not read message content for recommendations. `/delete-my-data confirm:True` removes your stored member records across servers. Discord messages and previously created backups are not removed by this command.',ephemeral=True)
+        await i.response.send_message('Teatro stores Discord IDs, film preferences, services, film and series watchlists, ratings, watched status, movie-night votes, RSVPs and reviews. Shared film watchlists and posted reviews are visible in the server; `/mylist` and series watchlists are private. It does not read message content for recommendations. `/delete-my-data confirm:True` removes your stored member records across servers, including series activity. Discord messages, roles and previously created backups are not removed by this command.',ephemeral=True)
 
     @bot.tree.command(name='delete-my-data',description='Delete your stored member preferences and activity across servers')
     async def delete_data(i:discord.Interaction,confirm:bool=False):
@@ -59,6 +98,10 @@ CREATE TABLE IF NOT EXISTS notifications(guild_id INTEGER,user_id INTEGER,releas
             try:
                 for table in ('votes','ratings','watched','watchlist','services','poll_votes','night_votes','rsvps','reviews','preferences','notifications','private_watchlist','curated','trivia_scores'):
                     await c.DB.execute(f'DELETE FROM {table} WHERE user_id=?',(i.user.id,))
+                for table in ('series_ratings','series_watched','series_watchlist'):
+                    exists=await c.DB.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,))
+                    if await exists.fetchone():
+                        await c.DB.execute(f'DELETE FROM {table} WHERE user_id=?',(i.user.id,))
                 await c.DB.execute('UPDATE nominations SET user_id=0 WHERE user_id=?',(i.user.id,))
                 await c.DB.execute('UPDATE nights SET host_id=0 WHERE host_id=?',(i.user.id,))
                 await c.DB.commit()
